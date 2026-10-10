@@ -1,10 +1,12 @@
+import asyncio
 import math
 import random
 import sys
 from array import array
 from functools import lru_cache
 
-import pygame
+import pygame 
+
 
 
 WIDTH = 1280
@@ -20,6 +22,7 @@ GOLD = (255, 211, 91)
 WHITE = (226, 241, 255)
 MUTED = (112, 147, 174)
 AUDIO_SAMPLE_RATE = 22050
+WEB_BUILD = sys.platform == "emscripten"
 
 
 @lru_cache(maxsize=8)
@@ -165,13 +168,14 @@ class Player:
         self.glow_boost = 0.0
         self.moving = False
 
-    def update(self, keys, dt):
+    def update(self, keys, dt, touch_direction=(0, 0)):
         direction = pygame.Vector2(
             float(keys[pygame.K_d] or keys[pygame.K_RIGHT])
             - float(keys[pygame.K_a] or keys[pygame.K_LEFT]),
             float(keys[pygame.K_s] or keys[pygame.K_DOWN])
             - float(keys[pygame.K_w] or keys[pygame.K_UP]),
         )
+        direction += pygame.Vector2(touch_direction)
         self.moving = direction.length_squared() > 0
         if direction.length_squared() > 0:
             direction = direction.normalize()
@@ -414,7 +418,10 @@ class TerminalParticle:
 class NanoEscapeGame:
     def __init__(self, screen):
         self.screen = screen
+        self.window = pygame.display.get_surface() or screen
         self.clock = pygame.time.Clock()
+        self.touch_fingers = {}
+        self.mouse_touch_action = None
         self.audio = SynthAudio()
         self.font = pygame.font.SysFont("consolas", 21)
         self.small_font = pygame.font.SysFont("consolas", 15)
@@ -446,6 +453,7 @@ class NanoEscapeGame:
         for y in range(0, HEIGHT, 4):
             pygame.draw.line(self.scanline_surface, (0, 4, 12, 34), (0, y), (WIDTH, y))
         self.fade_surface = pygame.Surface((WIDTH, HEIGHT))
+        self.touch_controls_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         self.fade_alpha = 0
         self.fade_mode = "in"
         self.display_score = 0.0
@@ -622,7 +630,7 @@ class NanoEscapeGame:
         self.elapsed += dt
         self.time_left = max(0.0, self.time_left - dt)
         keys = pygame.key.get_pressed()
-        self.player.update(keys, dt)
+        self.player.update(keys, dt, self.touch_direction())
         self.trail_timer -= dt
         if self.player.moving and self.trail_timer <= 0:
             trail_position = self.player.position - self.player.facing * 12
@@ -1079,12 +1087,76 @@ class NanoEscapeGame:
         if self.state not in ("title", "transition_out", "countdown", "ending"):
             self.draw_screen_effects()
 
+        if WEB_BUILD:
+            self.draw_touch_controls()
+
         if self.fade_alpha > 0:
             progress = min(1.0, max(0.0, self.fade_alpha / 255))
             alpha = int(255 * progress * progress * (3 - 2 * progress))
             self.fade_surface.fill((0, 0, 0))
             self.fade_surface.set_alpha(alpha)
             self.screen.blit(self.fade_surface, (0, 0))
+
+    def draw_touch_controls(self):
+        controls = self.touch_controls_surface
+        controls.fill((0, 0, 0, 0))
+        buttons = (
+            ((112, HEIGHT - 158), "^", "up"),
+            ((64, HEIGHT - 108), "<", "left"),
+            ((160, HEIGHT - 108), ">", "right"),
+            ((112, HEIGHT - 58), "v", "down"),
+        )
+        for center, label, action in buttons:
+            active = action in self.touch_fingers.values() or action == self.mouse_touch_action
+            fill = (45, 232, 255, 112) if active else (9, 24, 40, 176)
+            pygame.draw.circle(controls, fill, center, 40)
+            pygame.draw.circle(controls, (45, 232, 255, 190), center, 40, width=2)
+            draw_text(controls, self.font, label, WHITE, center, "center")
+
+        if self.can_start():
+            label = "TAP TO START" if self.state == "title" else "TAP TO RESTART"
+            button = pygame.Rect(WIDTH - 282, HEIGHT - 112, 252, 76)
+            pygame.draw.rect(controls, (9, 24, 40, 196), button, border_radius=12)
+            pygame.draw.rect(controls, (*CYAN, 190), button, width=2, border_radius=12)
+            draw_text(controls, self.small_font, label, WHITE, button.center, "center")
+        self.screen.blit(controls, (0, 0))
+
+    def can_start(self):
+        return self.state in ("title", "game_over", "victory") or (
+            self.state == "ending"
+            and self.terminal_elapsed >= self.terminal_reveal_time
+        )
+
+    def start_transition(self):
+        self.transition_from = self.state
+        self.state = "transition_out"
+        self.fade_alpha = 0
+        self.fade_mode = "out"
+
+    @staticmethod
+    def touch_action_at(position):
+        buttons = (
+            ((112, HEIGHT - 158), "up"),
+            ((64, HEIGHT - 108), "left"),
+            ((160, HEIGHT - 108), "right"),
+            ((112, HEIGHT - 58), "down"),
+        )
+        center, action = min(
+            buttons,
+            key=lambda button: pygame.Vector2(position).distance_squared_to(button[0]),
+        )
+        if pygame.Vector2(position).distance_squared_to(center) <= 40 ** 2:
+            return action
+        return None
+
+    def touch_direction(self):
+        actions = set(self.touch_fingers.values())
+        if self.mouse_touch_action is not None:
+            actions.add(self.mouse_touch_action)
+        return (
+            int("right" in actions) - int("left" in actions),
+            int("down" in actions) - int("up" in actions),
+        )
 
     def draw_screen_effects(self):
         if self.camera_shake_time > 0:
@@ -1115,7 +1187,23 @@ class NanoEscapeGame:
             pygame.draw.line(self.cue_line, (255, 55, 78, line_alpha), (0, 1), (430, 1), 2)
             self.screen.blit(self.cue_line, self.cue_line.get_rect(center=(WIDTH // 2, 218)))
 
-    def run(self):
+    def render(self):
+        window = self.window
+        target_size = window.get_size()
+        if target_size == self.screen.get_size():
+            window.blit(self.screen, (0, 0))
+            return
+
+        scale = min(target_size[0] / self.screen.get_width(), target_size[1] / self.screen.get_height())
+        fit_width = max(1, int(round(self.screen.get_width() * scale)))
+        fit_height = max(1, int(round(self.screen.get_height() * scale)))
+        offset_x = max(0, (target_size[0] - fit_width) // 2)
+        offset_y = max(0, (target_size[1] - fit_height) // 2)
+        scaled = pygame.transform.smoothscale(self.screen, (fit_width, fit_height))
+        window.fill(BACKGROUND)
+        window.blit(scaled, (offset_x, offset_y))
+
+    async def run(self):
         running = True
         while running:
             dt = min(self.clock.tick(FPS) / 1000.0, 0.05)
@@ -1123,27 +1211,47 @@ class NanoEscapeGame:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
+                elif event.type == pygame.VIDEORESIZE and not WEB_BUILD:
+                    self.window = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
-                    elif event.key == pygame.K_RETURN and (
-                        self.state in ("title", "game_over", "victory")
-                        or (
-                            self.state == "ending"
-                            and self.terminal_elapsed >= self.terminal_reveal_time
-                        )
-                    ):
-                        self.transition_from = self.state
-                        self.state = "transition_out"
-                        self.fade_alpha = 0
-                        self.fade_mode = "out"
+                    elif event.key == pygame.K_RETURN and self.can_start():
+                        self.start_transition()
+                elif WEB_BUILD and event.type == pygame.FINGERDOWN:
+                    position = (event.x * WIDTH, event.y * HEIGHT)
+                    if self.can_start() and position[0] > WIDTH * 0.55 and position[1] > HEIGHT * 0.55:
+                        self.start_transition()
+                    else:
+                        self.touch_fingers[event.finger_id] = self.touch_action_at(position)
+                elif WEB_BUILD and event.type == pygame.FINGERMOTION:
+                    position = (event.x * WIDTH, event.y * HEIGHT)
+                    self.touch_fingers[event.finger_id] = self.touch_action_at(position)
+                elif WEB_BUILD and event.type == pygame.FINGERUP:
+                    self.touch_fingers.pop(event.finger_id, None)
+                elif WEB_BUILD and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if self.can_start() and event.pos[0] > WIDTH * 0.55 and event.pos[1] > HEIGHT * 0.55:
+                        self.start_transition()
+                    else:
+                        self.mouse_touch_action = self.touch_action_at(event.pos)
+                elif WEB_BUILD and event.type == pygame.MOUSEMOTION and self.mouse_touch_action is not None:
+                    self.mouse_touch_action = self.touch_action_at(event.pos)
+                elif WEB_BUILD and event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    self.mouse_touch_action = None
 
+            self.touch_fingers = {
+                finger_id: action
+                for finger_id, action in self.touch_fingers.items()
+                if action is not None
+            }
             self.update(dt)
             self.draw()
+            self.render()
             pygame.display.flip()
+            await asyncio.sleep(0)
 
 
-def main():
+async def main():
     pygame.mixer.pre_init(AUDIO_SAMPLE_RATE, -16, 1, 512)
     pygame.init()
     if pygame.mixer.get_init() is None:
@@ -1152,11 +1260,14 @@ def main():
         except pygame.error as error:
             print(f"Audio unavailable; continuing without sound: {error}", file=sys.stderr)
     pygame.display.set_caption("NANO ESCAPE // Cybernetic Lockdown")
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    NanoEscapeGame(screen).run()
-    pygame.quit()
-    sys.exit()
+    window = pygame.display.set_mode((WIDTH, HEIGHT), 0 if WEB_BUILD else pygame.RESIZABLE)
+    screen = pygame.Surface((WIDTH, HEIGHT))
+    game = NanoEscapeGame(screen)
+    game.window = window
+    await game.run()
+    if not WEB_BUILD:
+        pygame.quit()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
