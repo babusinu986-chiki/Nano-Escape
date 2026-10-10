@@ -5,7 +5,7 @@ import sys
 from array import array
 from functools import lru_cache
 
-import pygame 
+import pygame
 
 
 
